@@ -54,6 +54,11 @@ class FetchEngine:
         self.cooldowns: dict[str, float] = {}  # origin -> unix ts until which requests are delayed
         self.client: httpx.AsyncClient | None = None
         self._stopping = False
+        # Cancellation registry. Announcement ids are added at the moment the
+        # cancellation is durably registered; per-job events let a cooldown
+        # sleep wake up immediately instead of waiting out the backoff.
+        self._cancelled_ann_ids: set[int] = set()
+        self._cancel_events: dict[str, asyncio.Event] = {}
 
     async def start(self) -> None:
         self.client = httpx.AsyncClient(
@@ -67,6 +72,16 @@ class FetchEngine:
             self.cooldowns[row["origin"]] = row["until_ts"]
         if self.cooldowns:
             log.info("restored %d active cooldown(s) from database", len(self.cooldowns))
+        # Rebuild the cancellation registry so a restart never resumes a
+        # cancelled job (its announcements are already 'cancelled' in the DB,
+        # but the in-memory registry must match).
+        for row in self.db.cancelled_job_ids():
+            self._cancel_events[row] = asyncio.Event()
+            self._cancel_events[row].set()
+        self._cancelled_ann_ids = set(self.db.cancelled_announcement_ids())
+        if self._cancelled_ann_ids:
+            log.info("restored cancellation state: %d announcement(s) stay cancelled",
+                     len(self._cancelled_ann_ids))
 
     async def stop(self) -> None:
         self._stopping = True
@@ -82,13 +97,36 @@ class FetchEngine:
         return dict(self.cooldowns)
 
     # ------------------------------------------------------------------
-    def submit(self, ann_id: int, url: str, hops: int, attempts: int) -> None:
+    def register_cancellation(self, job_id: str, ann_ids: list[int]) -> None:
+        """Mirror a durably-registered cancellation into the running engine.
+
+        Called only after the DB transaction succeeded; failure before this
+        point leaves the job running untouched. Queued tasks for these
+        announcements are dropped at dequeue time, cooldown sleeps are woken
+        via the per-job event, and any in-flight response is discarded because
+        DB writes to cancelled rows are rejected.
+        """
+        event = self._cancel_events.get(job_id)
+        if event is None:
+            event = asyncio.Event()
+            self._cancel_events[job_id] = event
+        self._cancelled_ann_ids.update(ann_ids)
+        event.set()
+        log.info("cancellation registered for job %s: %d announcement(s) retired",
+                 job_id, len(ann_ids))
+
+    # ------------------------------------------------------------------
+    def submit(self, ann_id: int, job_id: str, url: str, hops: int, attempts: int) -> None:
         """Enqueue a fetch task against the queue of its (target) origin."""
+        # Redirect/retry generated after the job was cancelled never leaves.
+        if ann_id in self._cancelled_ann_ids:
+            log.info("dropping unsent task for cancelled ann=%s (%s)", ann_id, url)
+            return
         origin = origin_of(url)
         queue = self.origin_queues.get(origin)
         if queue is None:
             queue = self.origin_queues[origin] = asyncio.Queue()
-        queue.put_nowait((ann_id, url, hops, attempts))
+        queue.put_nowait((ann_id, job_id, url, hops, attempts))
         pump = self.origin_pumps.get(origin)
         if pump is None or pump.done():
             self.origin_pumps[origin] = asyncio.create_task(self._pump(origin))
@@ -99,19 +137,36 @@ class FetchEngine:
         try:
             while not self._stopping:
                 try:
-                    ann_id, url, hops, attempts = await asyncio.wait_for(
+                    ann_id, job_id, url, hops, attempts = await asyncio.wait_for(
                         queue.get(), timeout=PUMP_IDLE_TIMEOUT
                     )
                 except asyncio.TimeoutError:
                     return  # idle: exit; submit() recreates the pump on demand
+                # Cancellation checkpoint 1: never-sent requests (including the
+                # redirects/retries already queued) are dropped without any HTTP call.
+                if ann_id in self._cancelled_ann_ids:
+                    log.info("ann=%s cancelled while queued at %s; no request sent", ann_id, origin)
+                    continue
                 # Cooldown wait happens BEFORE taking a global slot, so a
                 # delayed origin never blocks the global quota nor other origins.
                 delay = self.cooldowns.get(origin, 0.0) - time.time()
                 if delay > 0:
                     log.info("origin %s in cooldown, task ann=%s delayed %.1fs", origin, ann_id, delay)
-                    await asyncio.sleep(delay)
+                    event = self._cancel_events.get(job_id)
+                    if event is not None:
+                        try:
+                            await asyncio.wait_for(event.wait(), timeout=delay)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(delay)
+                    # Cancellation checkpoint 2: the cooldown wait was cut short
+                    # by cancellation -- the request must still not be sent.
+                    if ann_id in self._cancelled_ann_ids:
+                        log.info("ann=%s cancelled during cooldown; no request sent", ann_id)
+                        continue
                 try:
-                    await self._fetch_one(ann_id, url, hops, attempts)
+                    await self._fetch_one(ann_id, job_id, url, hops, attempts)
                 except Exception:  # pragma: no cover - defensive
                     log.exception("unexpected engine error on ann=%s", ann_id)
                     self.db.update_ann(ann_id, status="failed", error="internal engine error")
@@ -120,7 +175,11 @@ class FetchEngine:
             if not queue.empty() and not self._stopping:
                 self.origin_pumps[origin] = asyncio.create_task(self._pump(origin))
 
-    async def _fetch_one(self, ann_id: int, url: str, hops: int, attempts: int) -> None:
+    async def _fetch_one(self, ann_id: int, job_id: str, url: str, hops: int, attempts: int) -> None:
+        # Cancellation checkpoint 3: last guard before the request is issued.
+        if ann_id in self._cancelled_ann_ids:
+            log.info("ann=%s cancelled before fetch; no request sent", ann_id)
+            return
         self.db.update_ann(ann_id, status="fetching", current_url=url, hops=hops, attempts=attempts)
         log.info("GET %s (ann=%s hop=%d attempt=%d)", url, ann_id, hops, attempts)
         async with self.global_sem:  # global quota: max 2 in-flight requests
@@ -128,8 +187,20 @@ class FetchEngine:
                 resp = await self.client.get(url)
             except httpx.HTTPError as exc:
                 log.warning("ann=%s network error: %s", ann_id, exc)
-                self._retry_or_fail(ann_id, url, hops, attempts, f"network error: {type(exc).__name__}")
+                if ann_id in self._cancelled_ann_ids:
+                    log.info("ann=%s cancelled while in flight; dropping network-error result", ann_id)
+                    return
+                self._retry_or_fail(ann_id, job_id, url, hops, attempts,
+                                    f"network error: {type(exc).__name__}")
                 return
+
+        # Cancellation checkpoint 4: the request was already in flight when the
+        # cancellation landed. Its response cannot change the terminal state:
+        # no success write, no retry, no redirect request is issued.
+        if ann_id in self._cancelled_ann_ids:
+            log.info("ann=%s cancelled while in flight; discarding HTTP %d response, no follow-up request",
+                     ann_id, resp.status_code)
+            return
 
         status = resp.status_code
 
@@ -143,7 +214,7 @@ class FetchEngine:
                     self.db.set_cooldown(origin, until)  # persisted: survives restarts
                 log.info("origin %s backs off for %ds (HTTP %d)", origin, retry_after, status)
             reason = f"HTTP {status}" + (f" (Retry-After {retry_after}s)" if retry_after is not None else "")
-            self._retry_or_fail(ann_id, url, hops, attempts, reason)
+            self._retry_or_fail(ann_id, job_id, url, hops, attempts, reason)
             return
 
         if status in REDIRECT_STATUSES:
@@ -159,7 +230,7 @@ class FetchEngine:
             log.info("ann=%s hop %d: %s -> %s", ann_id, hops + 1, url, target)
             # fresh retry budget for the new URL; queued against the TARGET origin
             self.db.update_ann(ann_id, status="pending", current_url=target, hops=hops + 1, attempts=0, error=None)
-            self.submit(ann_id, target, hops + 1, 0)
+            self.submit(ann_id, job_id, target, hops + 1, 0)
             return
 
         if 200 <= status < 300:
@@ -178,11 +249,11 @@ class FetchEngine:
         self.db.update_ann(ann_id, status="failed", error=f"HTTP {status}")
         log.warning("ann=%s failed with HTTP %d", ann_id, status)
 
-    def _retry_or_fail(self, ann_id: int, url: str, hops: int, attempts: int, reason: str) -> None:
+    def _retry_or_fail(self, ann_id: int, job_id: str, url: str, hops: int, attempts: int, reason: str) -> None:
         if attempts < MAX_RETRIES:
             log.info("ann=%s retry %d/%d for %s (%s)", ann_id, attempts + 1, MAX_RETRIES, url, reason)
             self.db.update_ann(ann_id, status="pending", attempts=attempts + 1, error=reason)
-            self.submit(ann_id, url, hops, attempts + 1)
+            self.submit(ann_id, job_id, url, hops, attempts + 1)
         else:
             self.db.update_ann(ann_id, status="failed",
                                error=f"{reason}; retries exhausted ({MAX_RETRIES})")

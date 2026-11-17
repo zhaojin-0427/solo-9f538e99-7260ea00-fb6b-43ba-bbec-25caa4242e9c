@@ -1,6 +1,7 @@
 """FastAPI application: submit jobs, query progress, download full corpus."""
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from collections import Counter
@@ -37,11 +38,12 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     app.state.engine = engine
 
-    # Resume unfinished announcements; successful ones are NOT re-fetched.
+    # Resume unfinished announcements; successful ones are NOT re-fetched and
+    # cancelled jobs are NOT resumed (their rows are already 'cancelled').
     resumed = 0
     for row in db.unfinished_announcements():
         db.update_ann(row["id"], status="pending")
-        engine.submit(row["id"], row["current_url"], row["hops"], row["attempts"])
+        engine.submit(row["id"], row["job_id"], row["current_url"], row["hops"], row["attempts"])
         resumed += 1
     log.info("startup: resumed %d unfinished announcement(s), active cooldowns: %s",
              resumed, engine.cooldowns_snapshot())
@@ -59,6 +61,9 @@ app = FastAPI(
         "HTML title and body text with shared quotas (2 in-flight requests "
         "globally, 1 per origin), per-origin cooldowns on 429/503 + "
         "Retry-After, max 3 redirect hops and max 2 retries per URL. "
+        "A running job can be cancelled (POST /jobs/{id}/cancel): unsent "
+        "requests, redirects and retries are never issued, in-flight responses "
+        "are discarded, collected progress is kept but no corpus is downloadable. "
         "The full JSON corpus is downloadable only when every announcement "
         "of a job succeeded."
     ),
@@ -100,12 +105,13 @@ async def create_job(payload: JobCreate):
     db.create_job(job_id, total=len(payload.urls))
     for url in payload.urls:
         ann_id = db.add_announcement(job_id, url)
-        engine.submit(ann_id, url, hops=0, attempts=0)
+        engine.submit(ann_id, job_id, url, hops=0, attempts=0)
     return {
         "job_id": job_id,
         "total": len(payload.urls),
         "status": "running",
         "progress_url": f"/jobs/{job_id}",
+        "cancel_url": f"/jobs/{job_id}/cancel",
         "download_url": f"/jobs/{job_id}/download",
     }
 
@@ -115,10 +121,18 @@ async def list_jobs():
     rows = app.state.db.list_jobs()
     jobs = []
     for r in rows:
-        status = "running" if r["unfinished"] else ("failed" if r["failed"] else "success")
+        if r["cancelled"]:
+            status = "cancelled"
+        elif r["unfinished"]:
+            status = "running"
+        elif r["failed"]:
+            status = "failed"
+        else:
+            status = "success"
         jobs.append({
             "job_id": r["id"], "created_at": r["created_at"], "total": r["total"],
-            "success": r["success"], "failed": r["failed"], "unfinished": r["unfinished"],
+            "success": r["success"], "failed": r["failed"],
+            "cancelled": r["cancelled_anns"], "unfinished": r["unfinished"],
             "status": status,
         })
     return {"jobs": jobs}
@@ -131,12 +145,13 @@ def _job_or_404(job_id: str):
     return job
 
 
-@app.get("/jobs/{job_id}", summary="Job progress with per-announcement status")
-async def job_progress(job_id: str):
-    job = _job_or_404(job_id)
+def _progress_body(job_id: str):
+    job = app.state.db.get_job(job_id)
     anns = app.state.db.list_announcements(job_id)
     counts = Counter(a["status"] for a in anns)
-    if counts["pending"] or counts["fetching"]:
+    if job["cancelled"]:
+        status = "cancelled"
+    elif counts["pending"] or counts["fetching"]:
         status = "running"
     elif counts["failed"]:
         status = "failed"
@@ -145,12 +160,14 @@ async def job_progress(job_id: str):
     return {
         "job_id": job_id,
         "status": status,
+        "cancelled": bool(job["cancelled"]),
         "created_at": job["created_at"],
         "total": len(anns),
         "pending": counts["pending"],
         "fetching": counts["fetching"],
         "success": counts["success"],
         "failed": counts["failed"],
+        "cancelled_announcements": counts["cancelled"],
         "downloadable": status == "success",
         "announcements": [
             {
@@ -169,9 +186,58 @@ async def job_progress(job_id: str):
     }
 
 
+@app.post(
+    "/jobs/{job_id}/cancel",
+    status_code=200,
+    summary="Cancel a running job (idempotent; repeat calls return the same terminal state)",
+)
+async def cancel_job(job_id: str):
+    db: DB = app.state.db
+    engine: FetchEngine = app.state.engine
+    _job_or_404(job_id)
+    try:
+        result = db.cancel_job(job_id)
+    except sqlite3.Error as exc:
+        # Registration failed: the transaction rolled back, the job keeps collecting.
+        log.exception("cancel registration failed for job %s", job_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"cancellation could not be registered, job continues: {type(exc).__name__}",
+        )
+    if result is None:  # pragma: no cover - ruled out by _job_or_404
+        raise HTTPException(status_code=404, detail="job not found")
+    state, ann_ids = result
+    if state == "not_running":
+        # A naturally finished job (all success/failed) cannot be cancelled:
+        # its conclusion and download eligibility are untouched.
+        raise HTTPException(
+            status_code=409,
+            detail=f"job is already in terminal state '{_progress_body(job_id)['status']}'; only running jobs can be cancelled",
+        )
+    if state == "cancelled_now":
+        engine.register_cancellation(job_id, ann_ids)
+        log.info("job %s cancelled: %d announcement(s) retired, progress of finished ones kept",
+                 job_id, len(ann_ids))
+        message = "job cancelled"
+    else:  # already_cancelled: repeat returns the original terminal state unchanged
+        message = "job was already cancelled"
+    return {"message": message, **_progress_body(job_id)}
+
+
+@app.get("/jobs/{job_id}", summary="Job progress with per-announcement status")
+async def job_progress(job_id: str):
+    _job_or_404(job_id)
+    return _progress_body(job_id)
+
+
 @app.get("/jobs/{job_id}/download", summary="Download full JSON corpus (only when ALL succeeded)")
 async def download_corpus(job_id: str):
-    _job_or_404(job_id)
+    job = _job_or_404(job_id)
+    if job["cancelled"]:
+        raise HTTPException(
+            status_code=409,
+            detail="this job was cancelled; its partial progress is retained but no corpus is provided",
+        )
     anns = app.state.db.list_announcements(job_id)
     not_done = [a for a in anns if a["status"] != "success"]
     if not_done:
